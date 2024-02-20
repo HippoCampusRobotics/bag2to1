@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+from pathlib import Path
+
+from rosbags.interfaces import (
+    Connection,
+    ConnectionExtRosbag1,
+    ConnectionExtRosbag2,
+)
+from rosbags.rosbag1 import Writer
+from rosbags.rosbag2 import Reader
+from rosbags.serde import cdr_to_ros1
+from rosbags.typesys.msg import generate_msgdef
+
+import msg_definitions
+
+
+def downgrade_connection(rconn: Connection) -> Connection:
+    assert isinstance(rconn.ext, ConnectionExtRosbag2)
+    msgdef, md5sum = generate_msgdef(rconn.msgtype)
+    return Connection(
+        rconn.id,
+        rconn.topic,
+        rconn.msgtype,
+        msgdef,
+        md5sum,
+        -1,
+        ConnectionExtRosbag1(
+            None,
+            int('durability: 1' in rconn.ext.offered_qos_profiles),
+        ),
+        None,
+    )
+
+
+def convert_2to1(src, dest, exclude_topics, include_topics):
+    with Reader(src) as reader, Writer(dest) as writer:
+        connmap: dict[int, Connection] = {}
+        for rconn in reader.connections:
+            candidate = downgrade_connection(rconn)
+            for conn in writer.connections:
+                if (conn.topic == candidate.topic
+                        and conn.digest == candidate.digest
+                        and conn.ext.latching == candidate.ext.latching):
+                    break
+            else:
+                conn = writer.add_connection(
+                    candidate.topic,
+                    candidate.msgtype,
+                    candidate.msgdef,
+                    candidate.digest,
+                    candidate.ext.callerid,
+                    candidate.ext.latching,
+                )
+            connmap[rconn.id] = conn
+        for rconn, timestamp, data in reader.messages(
+                connections=reader.connections):
+            data = cdr_to_ros1(data, rconn.msgtype)
+            writer.write(connmap[rconn.id], timestamp, data)
+
+
+def main():
+    # register the custom message definitions
+    msg_definitions.register_all_msg_types()
+    # specify the files to convert
+    input_files = [
+        'bagfiles/onboard_lemniscate_v_0.3',
+    ]
+    for input_file in input_files:
+        src = Path(input_file)
+        dest = Path(input_file + '_converted')
+        convert_2to1(src, dest)
+
+
+if __name__ == '__main__':
+    main()
